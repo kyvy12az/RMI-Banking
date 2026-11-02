@@ -1,0 +1,7 @@
+UI SVG verification — 2026-11-02
+Maven reactor: BUILD SUCCESS (common, server, client)
+Tests run: 13, Failures: 0, Errors: 0, Skipped: 0
+SVG_ASSETS_OK: 27 icons x 3 tints in client/target/client-1.0.0.jar
+SVG_ASSETS_OK: 27 icons x 3 tints in server/target/server-1.0.0.jar
+LAUNCHER_VISUAL_OK
+UI_SMOKE_OK: docs/screenshots/svg

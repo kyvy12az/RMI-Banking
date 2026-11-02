@@ -1,0 +1,13 @@
+CREATE DATABASE IF NOT EXISTS banking_db1 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE banking_db1;
+CREATE TABLE IF NOT EXISTS node_state (id INT PRIMARY KEY, seq BIGINT NOT NULL, fingerprint VARCHAR(64) NOT NULL) ENGINE=InnoDB;
+INSERT INTO node_state(id,seq,fingerprint) SELECT 1,0,'' WHERE NOT EXISTS (SELECT 1 FROM node_state WHERE id=1);
+CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY, username VARCHAR(64) NOT NULL UNIQUE, full_name VARCHAR(120) NOT NULL, phone VARCHAR(20) NOT NULL, password_hash VARCHAR(100) NOT NULL, role VARCHAR(16) NOT NULL, active BOOLEAN NOT NULL) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS accounts (id BIGINT PRIMARY KEY, user_id BIGINT NOT NULL UNIQUE, balance DECIMAL(19,0) NOT NULL CHECK (balance>=0), version BIGINT NOT NULL, active BOOLEAN NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id)) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS transfers (id VARCHAR(40) PRIMARY KEY, request_id VARCHAR(64) NOT NULL UNIQUE, sender BIGINT NOT NULL, recipient BIGINT NOT NULL, amount DECIMAL(19,0) NOT NULL CHECK(amount>0), note VARCHAR(255) NOT NULL, created_at VARCHAR(30) NOT NULL, status VARCHAR(24) NOT NULL, FOREIGN KEY(sender) REFERENCES accounts(id), FOREIGN KEY(recipient) REFERENCES accounts(id)) ENGINE=InnoDB;
+CREATE INDEX idx_transfers_sender ON transfers(sender,created_at);
+CREATE INDEX idx_transfers_recipient ON transfers(recipient,created_at);
+CREATE TABLE IF NOT EXISTS replication_events (seq BIGINT PRIMARY KEY, event_id VARCHAR(40) NOT NULL UNIQUE, event_type VARCHAR(30) NOT NULL, created_at VARCHAR(30) NOT NULL, schema_version INT NOT NULL, payload LONGTEXT NOT NULL) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS replication_deliveries (seq BIGINT NOT NULL, node_id VARCHAR(40) NOT NULL, ack BOOLEAN NOT NULL, attempts INT NOT NULL, next_attempt BIGINT NOT NULL, last_error VARCHAR(255) NOT NULL, PRIMARY KEY(seq,node_id), FOREIGN KEY(seq) REFERENCES replication_events(seq)) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS applied_events (seq BIGINT PRIMARY KEY, event_id VARCHAR(40) NOT NULL UNIQUE, digest VARCHAR(64) NOT NULL) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS sync_logs (id VARCHAR(40) PRIMARY KEY, created_at VARCHAR(30) NOT NULL, message VARCHAR(1000) NOT NULL) ENGINE=InnoDB;
