@@ -77,6 +77,24 @@ class BankIntegrationTest {
     return server + schema + "?connectionTimeZone=UTC&characterEncoding=UTF-8";
   }
 
+  @Test
+  void directMysqlUpdateIsCapturedAndCanBeReplayed() throws Exception {
+    org.junit.jupiter.api.Assumptions.assumeTrue(cfg.get("jdbc.url").startsWith("jdbc:mysql:"));
+    try (Store replica = new Store(config("2", url(), cfg.port("1"), cfg.port("2"), cfg.port("3")))) {
+      try (var c = db.pool.getConnection()) {
+        exec(c, "UPDATE accounts SET balance=123456 WHERE id=100001");
+      }
+      db.captureDirectUpdates();
+      db.captureDirectUpdates();
+      var events = db.read(c -> rows(c, "SELECT * FROM replication_events ORDER BY seq"));
+      assertEquals(2, events.size());
+      for (var row : events) replica.apply(Store.event(row));
+      replica.apply(Store.event(events.get(1)));
+      long balance = replica.read(c -> count(c, "SELECT balance FROM accounts WHERE id=100001"));
+      assertEquals(123456L, balance);
+    }
+  }
+
   @BeforeEach
   void setup() throws Exception {
     cfg = config("1", url(), freePort(), freePort(), freePort());

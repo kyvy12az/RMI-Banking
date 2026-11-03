@@ -110,3 +110,24 @@ Ngày 02/11/2026 đã chạy thành công 13/13 ca trên H2 và MariaDB 10.4.32 
 Tại máy làm việc hiện tại, ba CSDL demo đã được tạo; cấu hình và mật khẩu demo ngẫu nhiên nằm trong các file **không đưa vào Git**: `config/server*.local.properties`, `config/demo.local.properties`. Có thể chạy lại server và Client bằng các lệnh trên. Khi mang dự án sang máy khác, thực hiện quy trình cấu hình và bootstrap từ đầu.
 
 Giao diện SVG mới: xem [tích hợp FlatSVGIcon và ảnh chụp](docs/UI-SVG.md).
+
+### Đồng bộ UPDATE trực tiếp trên MySQL
+
+Nâng cấp và khởi động lại Server 2, Server 3 trước Server 1. Tài khoản JDBC
+của PRIMARY cần quyền tạo bảng và trigger trong `banking_db1`. Server 1
+tự cài trigger cho `users`, `accounts` và `transfers` khi khởi động.
+
+Sau khi cả cụm chạy bản mới, có thể thử trên dữ liệu demo bằng HeidiSQL:
+
+```sql
+UPDATE banking_db1.accounts SET balance = 123456 WHERE id = 100001;
+```
+
+Dùng ID của tài khoản có sẵn trên cả cụm. Sau khi commit, Server 1 gom các
+dòng đã sửa, tạo sự kiện `DIRECT_UPDATE` trong lượt đồng bộ tiếp theo.
+Replica mất kết nối sẽ nhận lại sự kiện khi kết nối được. Tải lại bảng
+`accounts` trên Server 2 và Server 3 để xem kết quả.
+
+Cơ chế này dành cho UPDATE trên các dòng hiện có, giữ nguyên khóa chính.
+Tránh hoán đổi giá trị UNIQUE giữa các dòng bằng các giá trị trung gian
+trong SQL thủ công vì hàng đợi gom theo trạng thái cuối của mỗi dòng.

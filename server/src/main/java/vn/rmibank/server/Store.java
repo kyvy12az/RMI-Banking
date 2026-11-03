@@ -12,6 +12,9 @@ import vn.rmibank.common.Api.*;
 
 public final class Store implements AutoCloseable {
   final HikariDataSource pool;
+  private final List<String> directUpdatePeers;
+  private static final List<String> DIRECT_UPDATE_TABLES = List.of("users", "accounts", "transfers");
+  private static final String DIRECT_UPDATE = "DIRECT_UPDATE";
   static final Gson JSON = new Gson();
   static final ThreadLocal<List<String>> LOG_BUFFER = new ThreadLocal<>();
 
@@ -28,6 +31,8 @@ public final class Store implements AutoCloseable {
     h.setTransactionIsolation("TRANSACTION_READ_COMMITTED");
     h.setConnectionTimeout(5000);
     pool = new HikariDataSource(h);
+    directUpdatePeers =
+        cfg.primary() && h.getJdbcUrl().startsWith("jdbc:mysql:") ? cfg.peers() : null;
     try {
       String ddl =
           new String(
@@ -45,7 +50,13 @@ public final class Store implements AutoCloseable {
               }
             }
       }
-      read(
+      if (directUpdatePeers != null) {
+        read(c -> {
+          installDirectUpdateTriggers(c);
+          return null;
+        });
+      }
+      tx(
           c -> {
             List<Map<String, Object>> s = rows(c, "SELECT * FROM node_state WHERE id=1");
             String expected = str(s.get(0), "fingerprint");
@@ -80,6 +91,10 @@ public final class Store implements AutoCloseable {
       LOG_BUFFER.set(new ArrayList<>());
       try {
         rows(c, "SELECT seq FROM node_state WHERE id=1 FOR UPDATE");
+        if (directUpdatePeers != null) {
+          exec(c, "SET @rmibank_app_write = 1");
+          drainDirectUpdates(c);
+        }
         T value = work.run(c);
         c.commit();
         for (String message : LOG_BUFFER.get())
@@ -90,8 +105,78 @@ public final class Store implements AutoCloseable {
         throw ex;
       } finally {
         LOG_BUFFER.remove();
+        if (directUpdatePeers != null) {
+          try {
+            exec(c, "SET @rmibank_app_write = NULL");
+          } catch (SQLException ex) {
+            pool.evictConnection(c);
+          }
+        }
       }
     }
+  }
+
+  private void installDirectUpdateTriggers(Connection c) throws SQLException {
+    exec(c, """
+        CREATE TABLE IF NOT EXISTS direct_update_queue (
+          table_name VARCHAR(16) NOT NULL,
+          row_id VARCHAR(40) NOT NULL,
+          PRIMARY KEY (table_name, row_id)
+        ) ENGINE=InnoDB
+        """);
+    for (String table : DIRECT_UPDATE_TABLES) {
+      String trigger = "rmibank_capture_" + table;
+      if (count(c, """
+          SELECT COUNT(*) FROM information_schema.TRIGGERS
+          WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME=?
+          """, trigger) != 0) continue;
+      exec(c, """
+          CREATE TRIGGER %s BEFORE UPDATE ON %s FOR EACH ROW
+          BEGIN
+            DECLARE locked_seq BIGINT;
+            IF COALESCE(@rmibank_app_write, 0) = 0 THEN
+              IF BINARY OLD.id <> BINARY NEW.id THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'RMI Banking: row ID cannot change';
+              END IF;
+              SELECT seq INTO locked_seq FROM node_state WHERE id=1 FOR UPDATE;
+              INSERT INTO direct_update_queue VALUES ('%s', NEW.id)
+                ON DUPLICATE KEY UPDATE row_id=direct_update_queue.row_id;
+            END IF;
+          END
+          """.formatted(trigger, table, table));
+    }
+  }
+
+  void captureDirectUpdates() throws Exception {
+    if (directUpdatePeers != null) tx(c -> null);
+  }
+
+  private void drainDirectUpdates(Connection c) throws Exception {
+    var pending = rows(c, "SELECT * FROM direct_update_queue ORDER BY table_name DESC, row_id");
+    if (pending.isEmpty()) return;
+    List<UserImage> users = new ArrayList<>();
+    List<AccountImage> accounts = new ArrayList<>();
+    List<Transfer> transfers = new ArrayList<>();
+    for (var entry : pending) {
+      String table = str(entry, "table_name");
+      String id = str(entry, "row_id");
+      if (!DIRECT_UPDATE_TABLES.contains(table))
+        throw new BankException("Bảng không hỗ trợ đồng bộ UPDATE");
+      Object key = table.equals("transfers") ? id : Long.parseLong(id);
+      var matching = rows(c, "SELECT * FROM " + table + " WHERE id=?", key);
+      if (matching.isEmpty()) throw new BankException("Dòng UPDATE không còn tồn tại: " + table);
+      var row = matching.get(0);
+      switch (table) {
+        case "users" -> users.add(user(row));
+        case "accounts" -> accounts.add(image(row));
+        case "transfers" -> transfers.add(transfer(row));
+      }
+    }
+    if (!users.isEmpty() || !accounts.isEmpty())
+      append(c, DIRECT_UPDATE, new Payload(users, accounts, null), directUpdatePeers);
+    for (Transfer transfer : transfers)
+      append(c, DIRECT_UPDATE, new Payload(List.of(), List.of(), transfer), directUpdatePeers);
+    exec(c, "DELETE FROM direct_update_queue");
   }
 
   static void exec(Connection c, String sql, Object... args) throws SQLException {
@@ -287,7 +372,14 @@ public final class Store implements AutoCloseable {
             return new Ack(seq);
           }
           if (e.sequence() != seq + 1) throw new BankException("GAP: cần sequence " + (seq + 1));
+          boolean direct = DIRECT_UPDATE.equals(e.type());
           for (UserImage u : e.payload().users()) {
+            if (direct) {
+              updateExisting(c, "users", u.id(),
+                  "UPDATE users SET username=?,full_name=?,phone=?,password_hash=?,role=?,active=? WHERE id=?",
+                  u.username(), u.name(), u.phone(), u.passwordHash(), u.role(), u.active(), u.id());
+              continue;
+            }
             if (count(c, "SELECT COUNT(*) FROM users WHERE id=?", u.id()) == 0)
               exec(
                   c,
@@ -302,6 +394,12 @@ public final class Store implements AutoCloseable {
             else throw new BankException("User đã tồn tại ngoài event log");
           }
           for (AccountImage a : e.payload().accounts()) {
+            if (direct) {
+              updateExisting(c, "accounts", a.id(),
+                  "UPDATE accounts SET user_id=?,balance=?,version=?,active=? WHERE id=?",
+                  a.userId(), a.balance(), a.version(), a.active(), a.id());
+              continue;
+            }
             var old = rows(c, "SELECT * FROM accounts WHERE id=?", a.id());
             if (old.isEmpty())
               exec(
@@ -324,12 +422,26 @@ public final class Store implements AutoCloseable {
                   a.id());
             }
           }
-          if (e.payload().transfer() != null) insertTransfer(c, e.payload().transfer());
+          Transfer t = e.payload().transfer();
+          if (t != null) {
+            if (direct)
+              updateExisting(c, "transfers", t.id(),
+                  "UPDATE transfers SET request_id=?,sender=?,recipient=?,amount=?,note=?,created_at=?,status=? WHERE id=?",
+                  t.requestId(), t.sender(), t.recipient(), t.amount(), t.note(), t.time(), t.status(), t.id());
+            else insertTransfer(c, t);
+          }
           exec(c, "INSERT INTO applied_events VALUES(?,?,?)", e.sequence(), e.id(), dg);
           seal(c, e.sequence());
           log(c, "[SYNC] Áp dụng EVT=" + e.id() + " sequence=" + e.sequence());
           return new Ack(e.sequence());
         });
+  }
+
+  private static void updateExisting(
+      Connection c, String table, Object id, String sql, Object... args) throws Exception {
+    if (count(c, "SELECT COUNT(*) FROM " + table + " WHERE id=?", id) != 1)
+      throw new BankException("Replica thiếu dòng UPDATE: " + table);
+    exec(c, sql, args);
   }
 
   public void close() {

@@ -595,6 +595,12 @@ public final class BankService implements Bank, Replication, AutoCloseable {
   }
 
   void replicate() {
+    try {
+      db.captureDirectUpdates();
+    } catch (Exception ex) {
+      org.slf4j.LoggerFactory.getLogger(getClass()).error("Không thể ghi sự kiện UPDATE MySQL", ex);
+      return;
+    }
     for (String peer : cfg.peers()) {
       if (Thread.currentThread().isInterrupted()) return;
       if (System.currentTimeMillis() < nextTry.getOrDefault(peer, 0L)) continue;
