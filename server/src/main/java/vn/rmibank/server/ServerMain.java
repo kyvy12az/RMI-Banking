@@ -51,7 +51,7 @@ public final class ServerMain {
   }
 
   public static void main(String[] args) throws Exception {
-    String file = args.length == 0 ? "config/server3.local.properties" : args[0];
+    String file = args.length == 0 ? "config/server1.local.properties" : args[0];
     Config c = Config.load(file);
     System.setProperty("bank.node", c.id());
     if (java.util.Arrays.asList(args).contains("--gui")) {
