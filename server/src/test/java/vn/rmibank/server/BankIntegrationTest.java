@@ -319,7 +319,12 @@ class BankIntegrationTest {
       r2.rebind("Bank", stub2);
       r2.rebind("Replication", stub2);
       Bank client = (Bank) LocateRegistry.getRegistry("127.0.0.1", cfg.port("2")).lookup("Bank");
+      BankException duplicate =
+          assertThrows(BankException.class, () -> client.login("user1", PASSWORD, Role.CUSTOMER));
+      assertTrue(duplicate.getMessage().contains("Tài khoản đang có phiên đăng nhập hoạt động"));
+      bank.logout(token);
       Login l = client.login("user1", PASSWORD, Role.CUSTOMER);
+      token = l.token();
       client.transfer(l.token(), request(100002, "200000"));
       bank.replicate();
       assertEquals(2, db2.read(Store::sequence));

@@ -172,10 +172,17 @@ public final class BankService implements Bank, Replication, AutoCloseable {
           byte[] bytes = new byte[32];
           new SecureRandom().nextBytes(bytes);
           String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
-          long expiry = System.currentTimeMillis() + cfg.number("session.minutes") * 60000L;
-          sessions.entrySet().removeIf(e -> e.getValue().expiry() < System.currentTimeMillis());
-          sessions.put(token, new Session(num(u, "id"), expected, expiry));
-          return new Login(token, expected, str(u, "full_name"), expiry);
+          long userId = num(u, "id");
+          synchronized (sessions) {
+            long now = System.currentTimeMillis();
+            sessions.entrySet().removeIf(e -> e.getValue().expiry() < now);
+            if (sessions.values().stream().anyMatch(session -> session.user() == userId))
+              throw new BankException(
+                  "Không thể đăng nhập. Tài khoản đang có phiên đăng nhập hoạt động.");
+            long expiry = now + cfg.number("session.minutes") * 60000L;
+            sessions.put(token, new Session(userId, expected, expiry));
+            return new Login(token, expected, str(u, "full_name"), expiry);
+          }
         });
   }
 
