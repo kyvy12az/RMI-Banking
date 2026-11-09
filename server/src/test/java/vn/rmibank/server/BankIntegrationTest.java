@@ -46,6 +46,7 @@ class BankIntegrationTest {
     p.setProperty("retry.base.ms", "1");
     p.setProperty("retry.max.ms", "10");
     p.setProperty("session.minutes", "60");
+    p.setProperty("backup.dir", "target/test-backups/" + UUID.randomUUID());
     p.setProperty("rmi.registry.port", "" + (id.equals("1") ? p1 : id.equals("2") ? p2 : p3));
     p.setProperty("rmi.service.port", "0");
     p.setProperty("java.rmi.server.hostname", "127.0.0.1");
@@ -80,7 +81,8 @@ class BankIntegrationTest {
   @Test
   void directMysqlUpdateIsCapturedAndCanBeReplayed() throws Exception {
     org.junit.jupiter.api.Assumptions.assumeTrue(cfg.get("jdbc.url").startsWith("jdbc:mysql:"));
-    try (Store replica = new Store(config("2", url(), cfg.port("1"), cfg.port("2"), cfg.port("3")))) {
+    try (Store replica =
+        new Store(config("2", url(), cfg.port("1"), cfg.port("2"), cfg.port("3")))) {
       try (var c = db.pool.getConnection()) {
         exec(c, "UPDATE accounts SET balance=123456 WHERE id=100001");
       }
@@ -308,9 +310,12 @@ class BankIntegrationTest {
             c -> count(c, "SELECT COUNT(*) FROM replication_deliveries WHERE ack=FALSE")));
     db.read(
         c -> {
+          if (cfg.get("jdbc.url").startsWith("jdbc:mysql:")) exec(c, "SET @rmibank_app_write=1");
           exec(c, "UPDATE accounts SET balance=1 WHERE id=100001");
+          if (cfg.get("jdbc.url").startsWith("jdbc:mysql:")) exec(c, "SET @rmibank_app_write=NULL");
           return null;
         });
+    db.close();
     assertThrows(IllegalStateException.class, () -> new Store(cfg));
   }
 

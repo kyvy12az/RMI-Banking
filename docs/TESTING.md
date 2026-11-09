@@ -1,3 +1,5 @@
+
+> Cập nhật 09/11/2026: xem [cơ chế UPDATE đa node/reset](CHANGE-CAPTURE.md) và [kết quả kiểm thử MySQL 8 mới](CHANGE-CAPTURE-TESTING.md). Nội dung bên dưới mô tả phiên bản trước nâng cấp.
 # Kết quả kiểm thử thực tế
 
 Ngày chạy: **02/11/2026**, Windows, JDK 17, Maven 3.9.11. Không dùng mock số dư hoặc dịch vụ HTTP.

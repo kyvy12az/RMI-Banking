@@ -102,6 +102,21 @@ public final class Api {
 
   public record Ack(long sequence) implements Serializable {}
 
+  public record ChangeRequest(
+      String requestId, String origin, String table, long rowId, String before, String after)
+      implements Serializable {
+    @Override
+    public String toString() {
+      return "ChangeRequest[" + requestId + "," + origin + "," + table + ":" + rowId + "]";
+    }
+  }
+
+  public record ChangeResult(String requestId, String status, long sequence, String detail)
+      implements Serializable {}
+
+  public record ResetResult(String requestId, long sequence, int accounts, String backup)
+      implements Serializable {}
+
   public static class BankException extends Exception {
     private final boolean definitive;
 
@@ -121,6 +136,12 @@ public final class Api {
 
   public interface Bank extends Remote {
     String ping() throws RemoteException;
+
+    ResetResult resetBalances(String token, String requestId) throws RemoteException, BankException;
+
+    ChangeResult setBalance(
+        String token, long account, BigDecimal balance, long expectedVersion, String requestId)
+        throws RemoteException, BankException;
 
     Account register(Registration request) throws RemoteException, BankException;
 
@@ -155,6 +176,12 @@ public final class Api {
 
   public interface Replication extends Remote {
     Node heartbeat(String secret) throws RemoteException, BankException;
+
+    ChangeResult submitChange(String secret, ChangeRequest request)
+        throws RemoteException, BankException;
+
+    List<Event> recoveryEvents(String secret, long after, int limit)
+        throws RemoteException, BankException;
 
     Ack apply(String secret, Event event) throws RemoteException, BankException;
   }

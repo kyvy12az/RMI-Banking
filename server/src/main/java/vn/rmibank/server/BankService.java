@@ -37,9 +37,8 @@ public final class BankService implements Bank, Replication, AutoCloseable {
   }
 
   public void start() {
-    if (cfg.primary())
-      worker.scheduleWithFixedDelay(
-          this::replicate, 0, cfg.number("heartbeat.ms"), TimeUnit.MILLISECONDS);
+    worker.scheduleWithFixedDelay(
+        this::cycle, 0, cfg.number("heartbeat.ms"), TimeUnit.MILLISECONDS);
   }
 
   Bank primary() throws RemoteException {
@@ -61,6 +60,7 @@ public final class BankService implements Bank, Replication, AutoCloseable {
 
   <T> T safe(Operation<T> op) throws BankException {
     try {
+      if (cfg.primary()) db.captureDirectUpdates();
       return op.run();
     } catch (BankException e) {
       throw e;
@@ -79,11 +79,15 @@ public final class BankService implements Bank, Replication, AutoCloseable {
       if (token != null) sessions.remove(token);
       throw new BankException("Phiên đã hết hạn. Vui lòng đăng nhập lại.");
     }
-    var users = db.read(c -> rows(c, "SELECT * FROM users WHERE id=?", s.user()));
-    if (users.isEmpty() || !bool(users.get(0), "active") || (role != null && s.role() != role))
-      throw new BankException("Không có quyền truy cập");
+    var users = db.read(c -> rows(c, "SELECT * FROM confirmed_users WHERE id=?", s.user()));
+    if (users.isEmpty()
+        || !bool(users.get(0), "active")
+        || !str(users.get(0), "role").equals(s.role().name())
+        || (role != null && s.role() != role)) throw new BankException("Không có quyền truy cập");
     if (s.role() == Role.CUSTOMER
-        && !db.read(c -> rows(c, "SELECT active FROM accounts WHERE user_id=?", s.user())).stream()
+        && !db
+            .read(c -> rows(c, "SELECT active FROM confirmed_accounts WHERE user_id=?", s.user()))
+            .stream()
             .allMatch(a -> bool(a, "active"))) throw new BankException("Tài khoản đã bị khóa");
     return s;
   }
@@ -153,7 +157,7 @@ public final class BankService implements Bank, Replication, AutoCloseable {
                   c ->
                       rows(
                           c,
-                          "SELECT * FROM users WHERE username=?",
+                          "SELECT * FROM confirmed_users WHERE username=?",
                           username.strip().toLowerCase(Locale.ROOT)));
           if (users.isEmpty()
               || !BCrypt.checkpw(password, str(users.get(0), "password_hash"))
@@ -166,7 +170,7 @@ public final class BankService implements Bank, Replication, AutoCloseable {
                       c ->
                           count(
                               c,
-                              "SELECT COUNT(*) FROM accounts WHERE user_id=? AND active=TRUE",
+                              "SELECT COUNT(*) FROM confirmed_accounts WHERE user_id=? AND active=TRUE",
                               num(u, "id")))
                   != 1) throw new BankException("Tài khoản đã bị khóa");
           byte[] bytes = new byte[32];
@@ -216,7 +220,7 @@ public final class BankService implements Bank, Replication, AutoCloseable {
                   account(
                       rows(
                               c,
-                              "SELECT a.*,u.full_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.user_id=?",
+                              "SELECT a.*,u.full_name FROM confirmed_accounts a JOIN confirmed_users u ON u.id=a.user_id WHERE a.user_id=?",
                               s.user())
                           .get(0)));
         });
@@ -232,7 +236,7 @@ public final class BankService implements Bank, Replication, AutoCloseable {
                 var r =
                     rows(
                         c,
-                        "SELECT a.id,u.full_name FROM accounts a JOIN users u ON u.id=a.user_id WHERE a.id=? AND a.active=TRUE AND u.active=TRUE",
+                        "SELECT a.id,u.full_name FROM confirmed_accounts a JOIN confirmed_users u ON u.id=a.user_id WHERE a.id=? AND a.active=TRUE AND u.active=TRUE",
                         id);
                 if (r.isEmpty())
                   throw new BankException("Tài khoản nhận không tồn tại hoặc bị khóa");
@@ -259,6 +263,12 @@ public final class BankService implements Bank, Replication, AutoCloseable {
                 "Yêu cầu không hợp lệ; số tiền nguyên từ 1 đến 1.000.000.000 đồng.");
           return db.tx(
               c -> {
+                if (count(
+                        c,
+                        "SELECT COUNT(*) FROM users WHERE id=? AND active=TRUE AND role=?",
+                        s.user(),
+                        "CUSTOMER")
+                    != 1) throw new BankException("Customer privileges revoked");
                 var src = rows(c, "SELECT * FROM accounts WHERE user_id=?", s.user());
                 if (src.isEmpty()) throw new BankException("Không tìm thấy tài khoản nguồn");
                 long sender = num(src.get(0), "id");
@@ -422,6 +432,110 @@ public final class BankService implements Bank, Replication, AutoCloseable {
         });
   }
 
+  public ResetResult resetBalances(String token, String requestId)
+      throws RemoteException, BankException {
+    if (!cfg.primary()) return primary().resetBalances(token, requestId);
+    return safe(
+        () -> {
+          var actor = session(token, Role.ADMIN);
+          return db.resetBalances(requestId, actor.user());
+        });
+  }
+
+  public ChangeResult setBalance(
+      String token, long account, BigDecimal balance, long expectedVersion, String requestId)
+      throws RemoteException, BankException {
+    if (!cfg.primary())
+      return primary().setBalance(token, account, balance, expectedVersion, requestId);
+    return safe(
+        () -> {
+          var actor = session(token, Role.ADMIN);
+          return db.setBalance(account, balance, expectedVersion, requestId, actor.user());
+        });
+  }
+
+  public ChangeResult submitChange(String secret, ChangeRequest request) throws BankException {
+    internal(secret);
+    if (!cfg.primary()) throw new BankException("Only PRIMARY confirms changes");
+    return safe(
+        () -> {
+          try {
+            return db.accept(request);
+          } catch (Exception failure) {
+            org.slf4j.LoggerFactory.getLogger(getClass())
+                .error(
+                    "[CHANGE_FAILURE] primary={} origin={} request={} table={} id={} reason={}",
+                    cfg.id(),
+                    request == null ? "unknown" : request.origin(),
+                    request == null ? "unknown" : request.requestId(),
+                    request == null ? "unknown" : request.table(),
+                    request == null ? 0 : request.rowId(),
+                    failureReason(failure));
+            throw failure;
+          }
+        });
+  }
+
+  public List<Event> recoveryEvents(String secret, long after, int limit) throws BankException {
+    internal(secret);
+    if (!cfg.primary() || after < 0 || limit < 1 || limit > 500)
+      throw new BankException("Invalid recovery event request");
+    return safe(
+        () ->
+            db.read(
+                c ->
+                    rows(
+                            c,
+                            "SELECT * FROM replication_events WHERE seq>? ORDER BY seq LIMIT ?",
+                            after,
+                            limit)
+                        .stream()
+                        .map(Store::event)
+                        .toList()));
+  }
+
+  void cycle() {
+    try {
+      if (cfg.primary()) replicate();
+      else relayChanges();
+    } catch (Exception ex) {
+      org.slf4j.LoggerFactory.getLogger(getClass())
+          .error("[CYCLE] node={} failure={}", cfg.id(), ex.getClass().getSimpleName());
+    }
+  }
+
+  void relayChanges() throws Exception {
+    db.captureDirectUpdates();
+    for (ChangeRequest request : db.pendingChanges()) {
+      if (Thread.currentThread().isInterrupted()) return;
+      try {
+        Replication remote =
+            (Replication)
+                LocateRegistry.getRegistry(
+                        cfg.host(cfg.get("primary.id")),
+                        cfg.port(cfg.get("primary.id")),
+                        new Net.Sockets(cfg.number("timeout.ms")))
+                    .lookup("Replication");
+        ChangeResult result = remote.submitChange(cfg.secret(), request);
+        db.acknowledge(request, result);
+      } catch (Exception ex) {
+        db.retry(request, ex);
+        break;
+      }
+    }
+  }
+
+  private static String failureReason(Exception failure) {
+    if (failure instanceof BankException) return failure.getMessage();
+    if (failure instanceof SQLException sql)
+      return sql.getClass().getSimpleName()
+          + " SQLState="
+          + sql.getSQLState()
+          + " code="
+          + sql.getErrorCode();
+    return failure.getClass().getSimpleName();
+  }
+
   void internal(String secret) throws BankException {
     if (secret == null
         || !MessageDigest.isEqual(
@@ -454,7 +568,36 @@ public final class BankService implements Bank, Replication, AutoCloseable {
   public Ack apply(String secret, Event e) throws BankException {
     internal(secret);
     if (cfg.primary()) throw new BankException("PRIMARY không nhận sự kiện replica");
-    return safe(() -> db.apply(e));
+    return safe(
+        () -> {
+          try {
+            return db.apply(e);
+          } catch (Exception failure) {
+            String accounts =
+                e == null || e.payload() == null
+                    ? "unknown"
+                    : e.payload().accounts().stream()
+                        .map(a -> Long.toString(a.id()))
+                        .toList()
+                        .toString();
+            String users =
+                e == null || e.payload() == null
+                    ? "unknown"
+                    : e.payload().users().stream()
+                        .map(u -> Long.toString(u.id()))
+                        .toList()
+                        .toString();
+            org.slf4j.LoggerFactory.getLogger(getClass())
+                .error(
+                    "[APPLY_FAILURE] node={} event={} accounts={} users={} reason={}",
+                    cfg.id(),
+                    e == null ? "unknown" : e.id(),
+                    accounts,
+                    users,
+                    failureReason(failure));
+            throw failure;
+          }
+        });
   }
 
   public Snapshot snapshot(String token) throws RemoteException, BankException {

@@ -766,6 +766,60 @@ public final class ClientMain extends JFrame {
         export = button("Xuất nhật ký", "file-text", false);
     actions.add(details);
     actions.add(export);
+    JButton editBalance = button("Sửa số dư", "settings", false);
+    editBalance.addActionListener(
+        e -> {
+          int row = accounts.getSelectedRow();
+          if (row < 0) {
+            error(new Exception("Chọn tài khoản cần sửa số dư"));
+            return;
+          }
+          long id = Long.parseLong(accounts.getValueAt(row, 0).toString());
+          var selected =
+              snapshot.accounts().stream().filter(a -> a.id() == id).findFirst().orElseThrow();
+          String entered =
+              JOptionPane.showInputDialog(
+                  this, "Số dư mới (VNĐ) cho tài khoản " + id, selected.balance().toPlainString());
+          if (entered == null) return;
+          try {
+            BigDecimal value = new BigDecimal(entered.strip());
+            if (value.signum() < 0 || value.stripTrailingZeros().scale() > 0)
+              throw new IllegalArgumentException("Nhập số tiền nguyên không âm");
+            if (JOptionPane.showConfirmDialog(
+                    this,
+                    "Đặt số dư tài khoản " + id + " thành " + money(value) + "?",
+                    "Xác nhận quản trị",
+                    JOptionPane.OK_CANCEL_OPTION)
+                != JOptionPane.OK_OPTION) return;
+            String request = UUID.randomUUID().toString();
+            Bank remote = bank;
+            String token = login.token();
+            editBalance.setEnabled(false);
+            async(
+                () -> remote.setBalance(token, id, value, selected.version(), request),
+                result -> {
+                  editBalance.setEnabled(true);
+                  if (result.status().equals("ACCEPTED"))
+                    success("Đã cập nhật số dư tại PRIMARY. Mã yêu cầu: " + request);
+                  else
+                    error(
+                        new Exception("Dữ liệu đã thay đổi hoặc không hợp lệ: " + result.detail()));
+                  refresh();
+                },
+                failure -> {
+                  editBalance.setEnabled(true);
+                  error(
+                      new Exception(
+                          "Chưa xác định kết quả. Giữ mã yêu cầu "
+                              + request
+                              + " để tra cứu/thử lại qua CLI. "
+                              + failure.getMessage()));
+                });
+          } catch (Exception ex) {
+            error(ex);
+          }
+        });
+    actions.add(editBalance);
     tables.add(actions);
     content.add(tables, "grow");
     work.add(content, "grow");

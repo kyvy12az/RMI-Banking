@@ -1,3 +1,5 @@
+
+> Nâng cấp 09/11/2026: đã thêm reset số dư quản trị một lần và hàng đợi UPDATE từ mọi node. Xem [hướng dẫn nâng cấp, phục hồi fingerprint và lệnh chạy](docs/CHANGE-CAPTURE.md). Các hướng dẫn cũ về đồng bộ một chiều cần đọc cùng tài liệu nâng cấp này.
 # RMI Banking
 
 Ứng dụng Java 17/Swing cho đề tài **đồng bộ 3 CSDL trên 3 server bằng Java RMI**. Client và server trao đổi qua RMI; PRIMARY commit nghiệp vụ và outbox trong một transaction JDBC. Hai REPLICA nhận sự kiện theo thứ tự và đồng bộ bù sau khi mất kết nối.

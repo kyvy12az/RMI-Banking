@@ -11,7 +11,7 @@ public final class BankCli {
   public static void main(String[] args) throws Exception {
     if (args.length < 4) {
       System.out.println(
-          "BankCli <client.properties> <nodeId> <username> me|history|transfer|lookup|snapshot|resync [arguments]");
+          "BankCli <client.properties> <nodeId> <username> me|history|transfer|lookup|snapshot|resync|reset-balances|set-balance [arguments]");
       return;
     }
     Properties p = Net.load(args[0]);
@@ -29,10 +29,31 @@ public final class BankCli {
     if (password == null)
       throw new IllegalArgumentException(
           "Đặt RMI_BANK_PASSWORD hoặc chạy trong terminal tương tác");
-    boolean admin = command.equals("snapshot") || command.equals("resync");
+    boolean admin =
+        command.equals("snapshot")
+            || command.equals("resync")
+            || command.equals("reset-balances")
+            || command.equals("set-balance");
     Login login = bank.login(args[2], password, admin ? Role.ADMIN : Role.CUSTOMER);
     try {
       switch (command) {
+        case "reset-balances" -> {
+          if (args.length != 6 || !args[4].equals("--confirm-reset-100000"))
+            throw new IllegalArgumentException("reset-balances --confirm-reset-100000 <UUID>");
+          System.out.println(bank.resetBalances(login.token(), args[5]));
+        }
+        case "set-balance" -> {
+          if (args.length != 8)
+            throw new IllegalArgumentException(
+                "set-balance <account> <amount> <expectedVersion> <UUID>");
+          System.out.println(
+              bank.setBalance(
+                  login.token(),
+                  Long.parseLong(args[4]),
+                  new BigDecimal(args[5]),
+                  Long.parseLong(args[6]),
+                  args[7]));
+        }
         case "me" -> System.out.println(bank.me(login.token()));
         case "history" ->
             bank.history(login.token(), "", "", "", 0, 100).rows().forEach(System.out::println);

@@ -3,3 +3,4 @@ config/*.local.properties
 logs/
 *.log
 .idea/
+/backups/
