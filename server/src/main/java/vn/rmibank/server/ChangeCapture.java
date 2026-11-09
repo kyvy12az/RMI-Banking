@@ -83,7 +83,23 @@ final class ChangeCapture {
                   + " BEFORE UPDATE ON transfers FOR EACH ROW BEGIN IF COALESCE(@rmibank_app_write,0)=0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='RMI Banking: transfer history is immutable'; END IF; END");
         }
       }
-      for (String operation : List.of("INSERT", "DELETE")) {
+      if (table.equals("accounts")) {
+        String name = "rmibank_capture_accounts_delete";
+        var existing = rows(c, "SELECT ACTION_STATEMENT FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME=?", name);
+        if (existing.isEmpty() || !str(existing.get(0), "action_statement").contains("account-delete-v1")) {
+          if (!existing.isEmpty()) throw new SQLException("Unexpected account DELETE trigger version; run maintenance");
+          exec(c, "CREATE TRIGGER " + name + " BEFORE DELETE ON accounts FOR EACH ROW BEGIN "
+              + "IF COALESCE(@rmibank_app_write,0)=0 THEN "
+              + "IF OLD.balance<>0 THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='RMI Banking: account balance must be zero before DELETE'; END IF; "
+              + "INSERT INTO change_requests(request_id,origin_node,table_name,row_id,before_image,after_image,state,attempts,next_attempt,detail,created_at) "
+              + "VALUES(UUID(),(SELECT node_id FROM capture_state WHERE id=1),'accounts',OLD.id,"
+              + jsonRow("accounts", "OLD")
+              + ",'null','PENDING',0,0,'account-delete-v1',DATE_FORMAT(UTC_TIMESTAMP(6),'%Y-%m-%dT%H:%i:%s.%f000Z')); END IF; END");
+        }
+        // The old guard stays in place if CREATE TRIGGER fails (for example missing DBA privileges).
+        exec(c, "DROP TRIGGER IF EXISTS rmibank_guard_accounts_delete");
+      }
+      for (String operation : table.equals("accounts") ? List.of("INSERT") : List.of("INSERT", "DELETE")) {
         String name = "rmibank_guard_" + table + "_" + operation.toLowerCase(Locale.ROOT);
         if (count(
                 c,
@@ -135,6 +151,20 @@ final class ChangeCapture {
     for (String table : TABLES) {
       var actual = rows(c, "SELECT * FROM " + table + " ORDER BY id FOR UPDATE");
       var confirmed = rows(c, "SELECT * FROM confirmed_" + table + " ORDER BY id");
+      if (table.equals("accounts")) {
+        Set<Long> present = new HashSet<>();
+        for (var row : actual) present.add(num(row, "id"));
+        for (var row : confirmed) {
+          long id = num(row, "id");
+          if (!present.contains(id) && count(c,
+              "SELECT COUNT(*) FROM change_requests WHERE table_name='accounts' AND row_id=? AND state='PENDING' AND after_image='null'", id) > 0) {
+            AccountDeletion.key(c, id);
+            exec(c, "INSERT INTO accounts VALUES(?,?,?,?,?)", id, num(row, "user_id"),
+                row.get("balance"), num(row, "version"), bool(row, "active"));
+          }
+        }
+        actual = rows(c, "SELECT * FROM accounts ORDER BY id FOR UPDATE");
+      }
       if (actual.size() != confirmed.size())
         throw new BankException("Untracked INSERT/DELETE in " + table + "; run Maintenance audit");
       for (int i = 0; i < actual.size(); i++) {
@@ -151,7 +181,8 @@ final class ChangeCapture {
                 "SELECT after_image FROM change_requests WHERE table_name=? AND row_id=? AND state='PENDING' ORDER BY local_order DESC",
                 table,
                 id))
-          if (normalized(table, a).equals(normalized(table, parse(str(pending, "after_image"))))) {
+          if (!str(pending, "after_image").trim().equals("null")
+              && normalized(table, a).equals(normalized(table, parse(str(pending, "after_image"))))) {
             captured = true;
             break;
           }
@@ -296,6 +327,9 @@ final class ChangeCapture {
       return new ChangeResult(
           r.requestId(), str(old, "state"), num(old, "confirmed_seq"), str(old, "detail"));
     }
+    if (AccountDeletion.proposal(r)
+        || (r.table().equals("accounts") && count(c, "SELECT COUNT(*) FROM deleted_accounts WHERE id=?", r.rowId()) > 0))
+      return AccountDeletion.accept(this, c, r, hash);
     var found = rows(c, "SELECT * FROM " + r.table() + " WHERE id=? FOR UPDATE", r.rowId());
     if (found.isEmpty())
       throw new BankException("Missing existing row " + r.table() + ":" + r.rowId());
@@ -324,6 +358,11 @@ final class ChangeCapture {
             ? new Payload(List.of(user(authoritative)), List.of(), null)
             : new Payload(List.of(), List.of(image(authoritative)), null);
     Event event = db.append(c, "ROW_UPDATE", p, cfg.peers());
+    return record(c, r, hash, state, detail, event);
+  }
+
+  ChangeResult record(Connection c, ChangeRequest r, String hash, String state, String detail, Event event)
+      throws Exception {
     exec(
         c,
         "INSERT INTO external_requests VALUES(?,?,?,?,?,?,?)",

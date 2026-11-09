@@ -15,6 +15,8 @@ final class Backup {
       List.of(
           "users",
           "accounts",
+          "account_keys",
+          "deleted_accounts",
           "transfers",
           "node_state",
           "replication_events",

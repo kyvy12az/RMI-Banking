@@ -80,12 +80,16 @@ public final class Maintenance {
     final Map<String, Transfer> transfers = new TreeMap<>();
 
     Replay(List<Event> events, long target) throws Exception {
+      this(events, target, new Config(new Properties()));
+    }
+
+    Replay(List<Event> events, long target, Config cfg) throws Exception {
       long next = 1;
       Set<String> ids = new HashSet<>();
       for (Event event : events) {
         if (event.sequence() != next++
             || !ids.add(event.id())
-            || (event.schema() != 1 && event.schema() != 2)
+            || (event.schema() != 1 && event.schema() != 2 && event.schema() != 3)
             || !List.of(
                     "BOOTSTRAP",
                     "REGISTER",
@@ -93,12 +97,18 @@ public final class Maintenance {
                     "ACCOUNT_STATE",
                     "DIRECT_UPDATE",
                     "ROW_UPDATE",
-                    "BALANCE_RESET")
+                    "BALANCE_RESET",
+                    "ACCOUNT_DELETE")
                 .contains(event.type()))
           throw new IllegalStateException(
               "Event log không hợp lệ tại sequence " + event.sequence());
-        for (UserImage u : event.payload().users()) users.put(u.id(), u);
-        for (AccountImage a : event.payload().accounts()) accounts.put(a.id(), a);
+        for (UserImage u : LegacyUserRecovery.users(event, cfg)) users.put(u.id(), u);
+        for (AccountImage a : event.payload().accounts()) {
+          if (event.type().equals(AccountDeletion.TYPE)) {
+            if (event.schema() != 3) throw new IllegalStateException("Invalid deletion schema");
+            accounts.remove(a.id());
+          } else accounts.put(a.id(), a);
+        }
         if (event.payload().transfer() != null)
           transfers.put(event.payload().transfer().id(), event.payload().transfer());
       }
@@ -167,7 +177,7 @@ public final class Maintenance {
       String observed = observedHash(c),
           stored = str(rows(c, "SELECT * FROM node_state WHERE id=1").get(0), "fingerprint");
       List<Event> events = sourceEvents(c, cfg, seq);
-      Replay replay = new Replay(events, seq);
+      Replay replay = new Replay(events, seq, cfg);
       List<String> blockers = new ArrayList<>();
       List<Difference> differences = new ArrayList<>();
       if (!JSON.toJson(rows(c, "SELECT * FROM transfers ORDER BY id"))
@@ -252,6 +262,7 @@ public final class Maintenance {
       c.commit();
       c.setAutoCommit(true);
       schema(c);
+      AccountDeletion.migrate(c, cfg);
       c.setAutoCommit(false);
       try {
         rows(c, "SELECT * FROM node_state WHERE id=1 FOR UPDATE");
@@ -261,7 +272,7 @@ public final class Maintenance {
           throw new IllegalStateException(
               "Database changed during maintenance migration; audit again");
         if (cfg.get("jdbc.url").startsWith("jdbc:mysql:")) exec(c, "SET @rmibank_app_write=1");
-        Replay replay = new Replay(plan.events(), plan.sequence());
+        Replay replay = new Replay(plan.events(), plan.sequence(), cfg);
         ChangeCapture.restoreRows(c, replay.userRows(), replay.accountRows());
         ChangeCapture.saveConfirmed(c);
         exec(c, "DELETE FROM capture_state WHERE id=1");

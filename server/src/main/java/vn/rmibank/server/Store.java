@@ -58,6 +58,7 @@ public final class Store implements AutoCloseable {
                     && (ex.getErrorCode() == 1061 || ex.getErrorCode() == 42111))) throw ex;
               }
             }
+        AccountDeletion.migrate(c, cfg);
         c.setAutoCommit(false);
         try {
           rows(c, "SELECT seq FROM node_state WHERE id=1 FOR UPDATE");
@@ -474,7 +475,9 @@ public final class Store implements AutoCloseable {
 
   Event append(Connection c, String type, Payload p, List<String> peers) throws Exception {
     long seq = sequence(c) + 1;
-    Event e = new Event(UUID.randomUUID().toString(), seq, type, now(), 2, p);
+    for (AccountImage image : p.accounts()) AccountDeletion.key(c, image.id());
+    int schema = type.equals(AccountDeletion.TYPE) ? 3 : 2;
+    Event e = new Event(UUID.randomUUID().toString(), seq, type, now(), schema, p);
     exec(
         c,
         "INSERT INTO replication_events VALUES(?,?,?,?,?,?)",
@@ -482,7 +485,7 @@ public final class Store implements AutoCloseable {
         e.id(),
         type,
         e.time(),
-        2,
+        schema,
         JSON.toJson(p));
     for (String peer : peers)
       exec(c, "INSERT INTO replication_deliveries VALUES(?,?,FALSE,0,0,'')", seq, peer);
@@ -525,7 +528,7 @@ public final class Store implements AutoCloseable {
   Ack apply(Event e) throws Exception {
     return tx(
         c -> {
-          if (e == null || (e.schema() != 1 && e.schema() != 2) || e.payload() == null)
+          if (e == null || (e.schema() != 1 && e.schema() != 2 && e.schema() != 3) || e.payload() == null)
             throw new BankException("Unsupported event schema; upgrade all nodes");
           long seq = sequence(c);
           String dg = digest(JSON.toJson(e));
@@ -538,9 +541,36 @@ public final class Store implements AutoCloseable {
             return new Ack(seq);
           }
           if (e.sequence() != seq + 1) throw new BankException("GAP: cần sequence " + (seq + 1));
+          if (e.type().equals(AccountDeletion.TYPE)) {
+            if (e.schema() != 3 || !e.payload().users().isEmpty()
+                || e.payload().accounts().size() != 1 || e.payload().transfer() != null)
+              throw new BankException("Invalid account deletion event");
+            AccountImage deleted = e.payload().accounts().get(0);
+            var existing = rows(c, "SELECT * FROM accounts WHERE id=?", deleted.id());
+            if (!existing.isEmpty()) {
+              AccountImage before = image(existing.get(0));
+              if (before.version() + 1 != deleted.version() || before.balance().signum() != 0
+                  || before.userId() != deleted.userId())
+                throw new BankException("Deletion before-image mismatch id=" + deleted.id());
+            }
+            AccountDeletion.remove(c, deleted);
+            exec(c, "INSERT INTO applied_events VALUES(?,?,?)", e.sequence(), e.id(), dg);
+            seal(c, e.sequence());
+            log(c, "[ACCOUNT_DELETE] node=" + cfg.id() + " account=" + deleted.id()
+                + " event=" + e.id() + " sequence=" + e.sequence());
+            return new Ack(e.sequence());
+          }
           boolean authoritative =
               List.of("DIRECT_UPDATE", "ROW_UPDATE", "BALANCE_RESET").contains(e.type());
-          for (UserImage u : e.payload().users()) {
+          if (LegacyUserRecovery.approved(e, cfg)) {
+            if (count(c, "SELECT COUNT(*) FROM users WHERE id=0") != 0
+                || count(c, "SELECT COUNT(*) FROM accounts WHERE user_id=0") != 0)
+              throw new BankException("Legacy recovery refused: user 0 exists/is referenced");
+            String backup = Backup.write(c, cfg, "before-legacy-user-noop");
+            log(c, "[LEGACY_RECOVERY] node=" + cfg.id() + " sequence=" + e.sequence()
+                + " event=" + e.id() + " digest=" + dg + " action=PHANTOM_USER_NOOP backup=" + backup);
+          }
+          for (UserImage u : LegacyUserRecovery.users(e, cfg)) {
             boolean exists = count(c, "SELECT COUNT(*) FROM users WHERE id=?", u.id()) == 1;
             if (authoritative) {
               if (!exists) throw new BankException("Replica missing user " + u.id());
@@ -569,6 +599,9 @@ public final class Store implements AutoCloseable {
             }
           }
           for (AccountImage a : e.payload().accounts()) {
+            if (count(c, "SELECT COUNT(*) FROM deleted_accounts WHERE id=?", a.id()) != 0)
+              throw new BankException("Cannot resurrect deleted account id=" + a.id());
+            AccountDeletion.key(c, a.id());
             var old = rows(c, "SELECT * FROM accounts WHERE id=?", a.id());
             if (old.isEmpty()) {
               if (authoritative) throw new BankException("Replica missing account " + a.id());

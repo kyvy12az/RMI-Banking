@@ -68,7 +68,7 @@ UPDATE users SET full_name='Nguyễn Văn A',phone='0912345678' WHERE id=2;
 
 Phạm vi: dữ liệu trên dòng users/accounts đang tồn tại, giữ nguyên id. Các ràng buộc username duy nhất, chủ sở hữu hợp lệ, số dư nguyên không âm, phone hợp lệ, role hợp lệ và password_hash phải là BCrypt vẫn được kiểm tra. `version` là metadata do hệ thống quản lý. Chuỗi đổi tên hoặc đổi chủ tài khoản có thể gửi qua queue; mỗi bước vẫn phải hợp lệ và sẽ bị từ chối nếu trước đó có thay đổi xung đột.
 
-Không INSERT/DELETE trực tiếp hoặc UPDATE lịch sử transfers; trigger bảo vệ các thao tác đó. Đăng ký và chuyển khoản phải dùng ứng dụng. Không SET cờ nội bộ, tắt trigger, sửa bảng confirmed hoặc sửa metadata đồng bộ.
+INSERT trực tiếp, DELETE users/transfers và UPDATE lịch sử transfers vẫn bị chặn. Bản mới hỗ trợ DELETE accounts số dư 0 qua PRIMARY; xem [đồng bộ DELETE tài khoản](ACCOUNT-DELETE.md). Cần nâng cấp JAR cả ba node trước khi dùng event schema 3. Đăng ký và chuyển khoản phải dùng ứng dụng. Không SET cờ nội bộ, tắt trigger, sửa bảng confirmed hoặc sửa metadata đồng bộ.
 
 Chạy các truy vấn trong `database/verify-cluster.sql` trên từng máy. Đợi PENDING về 0, các sequence bằng nhau và deliveries được ACK. Nhật ký có node nguồn, requestId, bảng/ID, trạng thái và nguyên nhân cụ thể. Nếu có deadlock từ một transaction SQL ngoài ứng dụng, MySQL rollback transaction đó; kiểm tra lỗi client SQL và gửi lại transaction. Transaction Java có retry deadlock giới hạn, không commit nửa giao dịch.
 

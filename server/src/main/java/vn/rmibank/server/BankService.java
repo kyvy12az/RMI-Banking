@@ -84,11 +84,11 @@ public final class BankService implements Bank, Replication, AutoCloseable {
         || !bool(users.get(0), "active")
         || !str(users.get(0), "role").equals(s.role().name())
         || (role != null && s.role() != role)) throw new BankException("Không có quyền truy cập");
-    if (s.role() == Role.CUSTOMER
-        && !db
-            .read(c -> rows(c, "SELECT active FROM confirmed_accounts WHERE user_id=?", s.user()))
-            .stream()
-            .allMatch(a -> bool(a, "active"))) throw new BankException("Tài khoản đã bị khóa");
+    if (s.role() == Role.CUSTOMER) {
+      var accounts = db.read(c -> rows(c, "SELECT active FROM confirmed_accounts WHERE user_id=?", s.user()));
+      if (accounts.isEmpty() || !accounts.stream().allMatch(a -> bool(a, "active")))
+        throw new BankException("Tài khoản đã bị khóa hoặc đã xóa");
+    }
     return s;
   }
 
@@ -120,7 +120,7 @@ public final class BankService implements Bank, Replication, AutoCloseable {
                 if (count(c, "SELECT COUNT(*) FROM users WHERE username=?", username) > 0)
                   throw new BankException("Tên đăng nhập đã tồn tại");
                 long id = count(c, "SELECT COALESCE(MAX(id),0)+1 FROM users"),
-                    account = count(c, "SELECT COALESCE(MAX(id),100000)+1 FROM accounts");
+                    account = count(c, "SELECT COALESCE(MAX(id),100000)+1 FROM account_keys");
                 exec(
                     c,
                     "INSERT INTO users VALUES(?,?,?,?,?,'CUSTOMER',TRUE)",

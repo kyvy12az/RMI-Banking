@@ -97,6 +97,70 @@ class BankIntegrationTest {
     }
   }
 
+  @Test
+  void legacyPhantomRecoveryRequiresExactApprovalAndPreservesTransfers() throws Exception {
+    try (Store replica = new Store(config("2", url(), cfg.port("1"), cfg.port("2"), cfg.port("3")))) {
+      Event bootstrap = db.read(c -> event(rows(c, "SELECT * FROM replication_events WHERE seq=1").get(0)));
+      replica.apply(bootstrap);
+      UserImage phantom = new UserImage(0, "legacy", "Legacy", "0901234567", "invalid", "CUSTOMER", true);
+      Event bad = new Event(UUID.randomUUID().toString(), 2, "DIRECT_UPDATE", now(), 1,
+          new Payload(List.of(phantom), List.of(), null));
+      assertThrows(BankException.class, () -> replica.apply(bad));
+      assertEquals(1L, (long) replica.read(Store::sequence));
+      replica.cfg.p().setProperty(LegacyUserRecovery.KEY, digest(JSON.toJson(bad)));
+      Event changed = new Event(bad.id(), 2, bad.type(), "changed", 1, bad.payload());
+      assertThrows(BankException.class, () -> replica.apply(changed));
+      Event modern = new Event(bad.id(), 2, bad.type(), bad.time(), 2, bad.payload());
+      replica.cfg.p().setProperty(LegacyUserRecovery.KEY, digest(JSON.toJson(modern)));
+      assertThrows(BankException.class, () -> replica.apply(modern));
+      replica.cfg.p().setProperty(LegacyUserRecovery.KEY, digest(JSON.toJson(bad)));
+      replica.apply(bad);
+      replica.apply(bad);
+      assertEquals(0L, (long) replica.read(c -> count(c, "SELECT COUNT(*) FROM users WHERE id=0")));
+      assertEquals(2L, (long) replica.read(c -> count(c, "SELECT COUNT(*) FROM applied_events")));
+      assertEquals(1L, (long) replica.read(c -> count(c, "SELECT COUNT(*) FROM sync_logs WHERE message LIKE '%PHANTOM_USER_NOOP%'")));
+      assertThrows(BankException.class, () -> replica.apply(changed));
+      Transfer t = new Transfer("legacy-recovery-transfer", UUID.randomUUID().toString(), 100001, 100002,
+          new BigDecimal("10000"), "After recovery", now(), "SUCCESS");
+      Event next = new Event(UUID.randomUUID().toString(), 3, "TRANSFER", now(), 2,
+          new Payload(List.of(), List.of(new AccountImage(100001, 1, new BigDecimal("990000"), 2, true),
+              new AccountImage(100002, 2, new BigDecimal("1010000"), 2, true)), t));
+      replica.apply(next);
+      replica.apply(next);
+      assertEquals(990000L, (long) replica.read(c -> count(c, "SELECT balance FROM accounts WHERE id=100001")));
+      assertEquals(1L, (long) replica.read(c -> count(c, "SELECT COUNT(*) FROM transfers")));
+      assertEquals(3L, (long) replica.read(Store::sequence));
+      assertEquals(replica.read(Store::fingerprint),
+          new Maintenance.Replay(List.of(bootstrap, bad, next), 3, replica.cfg).fingerprint());
+    }
+  }
+  @Test
+  void deletionEventsRejectStaleVersionsOwnersAndNonzeroBalances() throws Exception {
+    try (Store replica = new Store(config("2", url(), cfg.port("1"), cfg.port("2"), cfg.port("3")))) {
+      Event bootstrap = db.read(c -> event(rows(c, "SELECT * FROM replication_events WHERE seq=1").get(0)));
+      replica.apply(bootstrap);
+      Event premature = new Event(UUID.randomUUID().toString(), 2, "ACCOUNT_DELETE", now(), 3,
+          new Payload(List.of(), List.of(new AccountImage(100001, 1, BigDecimal.ZERO, 2, false)), null));
+      assertThrows(BankException.class, () -> replica.apply(premature));
+      Event update = new Event(UUID.randomUUID().toString(), 2, "ROW_UPDATE", now(), 2,
+          new Payload(List.of(), List.of(new AccountImage(100001, 1, BigDecimal.ZERO, 2, true)), null));
+      replica.apply(update);
+      for (AccountImage bad : List.of(new AccountImage(100001, 1, BigDecimal.ZERO, 4, false),
+          new AccountImage(100001, 2, BigDecimal.ZERO, 3, false))) {
+        Event invalid = new Event(UUID.randomUUID().toString(), 3, "ACCOUNT_DELETE", now(), 3,
+            new Payload(List.of(), List.of(bad), null));
+        assertThrows(BankException.class, () -> replica.apply(invalid));
+      }
+      assertEquals(1L, (long) replica.read(c -> count(c, "SELECT COUNT(*) FROM accounts WHERE id=100001")));
+      Event valid = new Event(UUID.randomUUID().toString(), 3, "ACCOUNT_DELETE", now(), 3,
+          new Payload(List.of(), List.of(new AccountImage(100001, 1, BigDecimal.ZERO, 3, false)), null));
+      replica.apply(valid);
+      replica.apply(valid);
+      assertEquals(0L, (long) replica.read(c -> count(c, "SELECT COUNT(*) FROM accounts WHERE id=100001")));
+      assertEquals(3L, (long) replica.read(Store::sequence));
+    }
+  }
+
   @BeforeEach
   void setup() throws Exception {
     cfg = config("1", url(), freePort(), freePort(), freePort());

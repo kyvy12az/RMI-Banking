@@ -44,9 +44,13 @@ Tiền dùng `BigDecimal` và `DECIMAL(19,0)`, phù hợp VND nguyên. Giới h�
 
 Client tạo UUID trước khi gửi, giữ dữ liệu yêu cầu trong Preferences theo cluster/account khi chưa biết kết quả. Không lưu mật khẩu hoặc session. Lỗi mạng không được coi là thất bại nghiệp vụ: UI cho phép tra cứu `findRequest` và gửi lại cùng payload/requestId. Không cho sửa form của yêu cầu đang chưa rõ kết quả. Lỗi kỹ thuật tại server (kể cả JDBC báo lỗi khi commit) có cờ kết quả chưa xác định; Client giữ nguyên requestId để tra cứu/thử lại. Khi PRIMARY trả COMMITTED, UI cập nhật số dư/lịch sử; trạng thái này độc lập với ACK của replica.
 
+## Xóa tài khoản từ SQL
+
+DELETE accounts số dư 0 được trigger ghi thành đề xuất có before-image và after-image null, gửi PRIMARY xác nhận theo version rồi phát ACCOUNT_DELETE schema 3. Bảng deleted_accounts lưu dấu xóa; account_keys giữ số tài khoản và khóa ngoại lịch sử transfers. Các node xử lý retry/idempotency qua outbox và applied_events, không cấp lại số tài khoản đã xóa. Xem [hướng dẫn DELETE](ACCOUNT-DELETE.md).
+
 ## Outbox và gửi bù
 
-Mọi event có eventId, sequence, type, timestamp UTC, schema version 1 và payload. Payload chứa **ảnh kết quả** của tài khoản/version và transfer đã commit; replica không thực thi lại nghiệp vụ trừ/cộng tiền.
+Mọi event có eventId, sequence, type, timestamp UTC, schema version và payload (1 cho lịch sử cũ, 2 cho cập nhật hiện tại, 3 cho ACCOUNT_DELETE). Payload chứa **ảnh kết quả** của tài khoản/version và transfer đã commit; replica không thực thi lại nghiệp vụ trừ/cộng tiền.
 
 Worker lấy heartbeat đã xác thực và sequence thực tế của mỗi replica, gửi tối đa 50 event liên tục mỗi lượt. Trước khi gửi tiếp, worker xác minh lại event tại sequence cuối cùng của replica; cluster khác có cùng số sequence nhưng khác event/digest bị từ chối. Nếu replica mới hoàn toàn, gửi lại từ event 1. Nếu mất ACK sau commit, heartbeat hoặc gửi trùng khôi phục trạng thái mà không áp dụng lại.
 

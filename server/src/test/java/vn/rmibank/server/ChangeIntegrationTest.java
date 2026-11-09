@@ -14,6 +14,155 @@ import vn.rmibank.common.Api.*;
 import vn.rmibank.common.Net;
 
 class ChangeIntegrationTest extends BankIntegrationTest {
+
+  @Test
+  void mysqlDeleteFromEveryNodeConvergesAndNeverReusesAccountNumbers() throws Exception {
+    requireMysql();
+    try (Cluster cluster = new Cluster()) {
+      long previous = 100002;
+      for (int node = 0; node < 3; node++) {
+        String username = "delete_node_" + node;
+        Account account = bank.register(new Registration("Delete test", username, "0901234567", PASSWORD));
+        assertTrue(account.id() > previous);
+        previous = account.id();
+        String session = bank.login(username, PASSWORD, Role.CUSTOMER).token();
+        cluster.sync();
+        raw(cluster.stores[node], "DELETE FROM accounts WHERE id=" + account.id());
+        cluster.sync();
+        for (Store store : cluster.stores) {
+          assertEquals(0L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM accounts WHERE id=?", account.id())));
+          assertEquals(1L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM deleted_accounts WHERE id=?", account.id())));
+          assertEquals(1L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM users WHERE username=?", username)));
+        }
+        assertThrows(BankException.class, () -> bank.me(session));
+        assertThrows(BankException.class, () -> bank.login(username, PASSWORD, Role.CUSTOMER));
+        cluster.equal();
+      }
+    }
+  }
+
+  @Test
+  void mysqlDeletePreservesHistoryAndRejectsMoneyLoss() throws Exception {
+    requireMysql();
+    try (Cluster cluster = new Cluster()) {
+      assertThrows(java.sql.SQLException.class, () -> raw(db, "DELETE FROM accounts WHERE id=100001"));
+      bank.transfer(token, request(100002, "1000000"));
+      cluster.sync();
+      raw(cluster.stores[2], "DELETE FROM accounts WHERE id=100001");
+      cluster.sync();
+      for (Store store : cluster.stores) {
+        assertEquals(0L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM accounts WHERE id=100001")));
+        assertEquals(1L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM transfers WHERE sender=100001")));
+        assertEquals(1L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM account_keys WHERE id=100001")));
+      }
+      assertThrows(java.sql.SQLException.class, () -> raw(db, "DELETE FROM users WHERE id=2"));
+      assertThrows(java.sql.SQLException.class, () -> raw(db, "DELETE FROM transfers"));
+      cluster.restart(2);
+      cluster.sync();
+      cluster.equal();
+      var all = db.read(c -> rows(c, "SELECT * FROM replication_events ORDER BY seq").stream().map(Store::event).toList());
+      assertEquals(db.read(Store::fingerprint), new Maintenance.Replay(all, all.size(), cfg).fingerprint());
+    }
+  }
+
+  @Test
+  void mysqlMultirowDeleteRollsBackAndSurvivesOfflineReplicaRestart() throws Exception {
+    requireMysql();
+    try (Cluster cluster = new Cluster()) {
+      Account a = bank.register(new Registration("Delete A", "delete_a", "0901234567", PASSWORD));
+      Account b = bank.register(new Registration("Delete B", "delete_b", "0901234567", PASSWORD));
+      cluster.sync();
+      try (var c = cluster.stores[1].pool.getConnection()) {
+        c.setAutoCommit(false);
+        exec(c, "DELETE FROM accounts WHERE id IN (?,?)", a.id(), b.id());
+        c.rollback();
+      }
+      assertEquals(0, cluster.stores[1].pendingChanges().size());
+      cluster.offline(2);
+      raw(cluster.stores[1], "DELETE FROM accounts WHERE id IN (" + a.id() + "," + b.id() + ")");
+      assertEquals(2, cluster.stores[1].pendingChanges().size());
+      cluster.restart(1);
+      assertEquals(2, cluster.stores[1].pendingChanges().size());
+      cluster.sync();
+      cluster.restart(2);
+      cluster.sync();
+      for (Store store : cluster.stores)
+        assertEquals(0L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM accounts WHERE id IN (?,?)", a.id(), b.id())));
+      cluster.equal();
+    }
+  }
+
+  @Test
+  void mysqlDeleteLosesConflictToConcurrentTransferWithoutLosingMoney() throws Exception {
+    requireMysql();
+    try (Cluster cluster = new Cluster()) {
+      Account a = bank.register(new Registration("Delete conflict", "delete_conflict", "0901234567", PASSWORD));
+      cluster.sync();
+      raw(cluster.stores[2], "DELETE FROM accounts WHERE id=" + a.id());
+      bank.transfer(token, request(a.id(), "1000"));
+      cluster.sync();
+      for (Store store : cluster.stores) {
+        assertEquals(1000, balance(store, a.id()));
+        assertEquals(999000, balance(store, 100001));
+      }
+      assertEquals(1L, (long) cluster.stores[2].read(c -> count(c, "SELECT COUNT(*) FROM change_requests WHERE row_id=? AND state='CONFLICT'", a.id())));
+      cluster.equal();
+    }
+  }
+
+  @Test
+  void mysqlLateUpdateAndRepeatedDeleteCannotResurrectAccount() throws Exception {
+    requireMysql();
+    try (Cluster cluster = new Cluster()) {
+      Account a = bank.register(new Registration("Delete replay", "delete_replay", "0901234567", PASSWORD));
+      cluster.sync();
+      raw(cluster.stores[1], "DELETE FROM accounts WHERE id=" + a.id());
+      ChangeRequest request = cluster.stores[1].pendingChanges().get(0);
+      ChangeResult first = bank.submitChange(SECRET, request);
+      assertEquals(first, bank.submitChange(SECRET, request));
+      assertThrows(BankException.class, () -> bank.submitChange(SECRET,
+          new ChangeRequest(request.requestId(), request.origin(), request.table(), request.rowId(), "{}", request.after())));
+      raw(cluster.stores[2], "UPDATE accounts SET balance=500 WHERE id=" + a.id());
+      cluster.sync();
+      for (Store store : cluster.stores) {
+        assertEquals(0L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM accounts WHERE id=?", a.id())));
+        assertEquals(1L, (long) store.read(c -> count(c, "SELECT COUNT(*) FROM deleted_accounts WHERE id=?", a.id())));
+      }
+      var deletes = db.read(c -> rows(c, "SELECT * FROM replication_events WHERE event_type='ACCOUNT_DELETE' ORDER BY seq"));
+      Event last = Store.event(deletes.get(deletes.size()-1));
+      cluster.stores[2].apply(last);
+      cluster.equal();
+    }
+  }
+
+  @Test
+  void mysqlMigratesLegacyHistoryForeignKeysWithoutDeletingHistory() throws Exception {
+    requireMysql();
+    bank.transfer(token, request(100002, "1000000"));
+    bank.close();
+    db.close();
+    try (var c = java.sql.DriverManager.getConnection(cfg.get("jdbc.url"), cfg.get("jdbc.user"), cfg.p().getProperty("jdbc.password", ""))) {
+      List<String> oldNames = new ArrayList<>();
+      try (var keys = c.getMetaData().getImportedKeys(c.getCatalog(), null, "transfers")) {
+        while (keys.next()) if (keys.getString("PKTABLE_NAME").equals("account_keys")) oldNames.add(keys.getString("FK_NAME"));
+      }
+      exec(c, "ALTER TABLE transfers ADD CONSTRAINT legacy_sender FOREIGN KEY(sender) REFERENCES accounts(id)");
+      exec(c, "ALTER TABLE transfers ADD CONSTRAINT legacy_recipient FOREIGN KEY(recipient) REFERENCES accounts(id)");
+      for (String name : oldNames) exec(c, "ALTER TABLE transfers DROP FOREIGN KEY `" + name.replace("`", "``") + "`");
+    }
+    db = new Store(cfg);
+    bank = new BankService(db, cfg);
+    raw(db, "DELETE FROM accounts WHERE id=100001");
+    db.captureDirectUpdates();
+    assertEquals(0L, (long) db.read(c -> count(c, "SELECT COUNT(*) FROM accounts WHERE id=100001")));
+    assertEquals(1L, (long) db.read(c -> count(c, "SELECT COUNT(*) FROM transfers")));
+    try (var c = db.pool.getConnection(); var keys = c.getMetaData().getImportedKeys(c.getCatalog(), null, "transfers")) {
+      int count = 0;
+      while (keys.next()) { assertEquals("account_keys", keys.getString("PKTABLE_NAME")); count++; }
+      assertEquals(2, count);
+    }
+  }
+
   void requireMysql() {
     Assumptions.assumeTrue(
         cfg.get("jdbc.url").startsWith("jdbc:mysql:"), "MySQL triggers require -Dbank.test.mysql");
